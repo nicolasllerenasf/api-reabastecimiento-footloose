@@ -19,7 +19,7 @@ function limpiarSku(raw: unknown): string {
       ? String(raw).trim()
       : '';
   sku = sku.replace(/[\r\n\s]/g, '');
-  // Excel a veces expone números como "11010000001.0" o en notación científica
+  // Clean numeric inputs
   if (sku.includes('.')) sku = sku.replace(/\.0+$/, '');
   return sku;
 }
@@ -39,7 +39,6 @@ export class ReplenishmentService {
   constructor(private readonly dataSource: DataSource) {}
 
   async procesarCargaExcel(fileBuffer: Buffer, idPedido: number) {
-    // cellText:true + raw:false para que los números largos no lleguen en notación científica
     const workbook = xlsx.read(fileBuffer, {
       type: 'buffer',
       cellText: true,
@@ -55,7 +54,7 @@ export class ReplenishmentService {
       header: 1,
       raw: false,
     });
-    const dataRows = rawData.slice(8); // la data empieza en la fila 9 (índice 8)
+    const dataRows = rawData.slice(8);
 
     const filasValidas: FilaExcel[] = [];
     const tiendasOrigenSet = new Set<string>();
@@ -64,8 +63,6 @@ export class ReplenishmentService {
     for (const row of dataRows) {
       if (!row || row.length === 0) continue;
 
-      // Columnas según formato del Excel (0-based):
-      // C=2 TdaOrigen, I=8 SKU, J=9 TdaDestino, K=10 Cantidad, Q=16 TipoLogistica, R=17 Motivo
       const tdaOrigen = row[2]?.toString().trim() ?? '';
       const sku = limpiarSku(row[8]);
       const tdaDestino = row[9]?.toString().trim() ?? '';
@@ -99,7 +96,6 @@ export class ReplenishmentService {
 
     const storesInList = buildInList(tiendasOrigen);
 
-    // 1) Zonas por tienda origen
     const zonasResult: { tienda: string; zona: string }[] = await this
       .dataSource.query(`
       SELECT LTRIM(RTRIM(fox_nombre)) AS tienda,
@@ -113,7 +109,6 @@ export class ReplenishmentService {
       storeZonaMap.set(r.tienda.trim(), r.zona.trim());
     }
 
-    // 2) Días por zona desde la tabla de configuración
     const configDiasResult: { zona: string; dias: number }[] = await this
       .dataSource.query(`
       SELECT UPPER(LTRIM(RTRIM(zona))) AS zona, MAX(config_fecha) AS dias
@@ -126,8 +121,6 @@ export class ReplenishmentService {
       zonaDiasMap.set(r.zona.trim(), Number(r.dias));
     }
 
-    // 3) Stock por tienda ORIGEN + SKU en lotes de 500 SKUs
-    //    QStockTdaOrigen = stock real en la tienda que va a enviar el producto
     const stockMap = new Map<string, number>();
     const chunkSize = 500;
 
@@ -154,16 +147,12 @@ export class ReplenishmentService {
       }
     }
 
-    // 4) Construir registros y calcular diasMax (el máximo entre todas las filas, igual que el PHP)
-    //    Se usa para actualizar FechaHasta en la cabecera del pedido
     let diasMax = 1;
 
     const registros = filasValidas.map((fila) => {
-      // Stock real de la tienda ORIGEN para ese SKU
       const stockKey = `${fila.tdaOrigen.toUpperCase()}|${fila.sku}`;
       const stockActual = stockMap.get(stockKey) ?? 0;
 
-      // Días de tránsito según la zona de la tienda origen
       const zona = storeZonaMap.get(fila.tdaOrigen.trim()) ?? '';
       const diasZona =
         zona && zonaDiasMap.has(zona) ? zonaDiasMap.get(zona)! : 14;
@@ -182,7 +171,6 @@ export class ReplenishmentService {
       };
     });
 
-    // 5) Inserción en lotes de 200 + update de cabecera, todo en una transacción
     await this.dataSource.transaction(async (txManager) => {
       const batchSize = 200;
       for (let i = 0; i < registros.length; i += batchSize) {
@@ -195,7 +183,6 @@ export class ReplenishmentService {
           .execute();
       }
 
-      // FechaHasta = FechaDesde + diasMax (la FechaDesde ya fue seteada al crear la cabecera)
       await txManager.query(`
         UPDATE tb_pedidos_logistica_inversa_cab
         SET FechaHasta = DATEADD(day, ${diasMax}, FechaDesde)
